@@ -25,10 +25,7 @@ package require procarg
 
 ::oo::class create vkapi {
 
-  variable app_id
-  variable lang
-  variable scope
-  variable access_token
+  variable setup
 
   variable rid
   variable response
@@ -36,9 +33,7 @@ package require procarg
   variable error
 
   constructor { args } {
-
-    set lang 0
-    set scope "friends photos audio video wall groups messages offline"
+    set setup [dict create lang 0 scope "friends,photos,audio,video,wall,groups,messages,offline"]
 
     set error [list apply {{ code msg } {
       upvar result result
@@ -79,22 +74,26 @@ package require procarg
 
   method setup { { args {
     {-app_id       string -nodefault}
-    {-scope        list   -nodefault -restrict {in {notify friends photos audio video docs notes pages status offers questions wall groups messages email notifications stats ads market offline nohttps}}}
+    {-scope        string -nodefault}
     {-lang         string -nodefault -restrict {ru ua be en es fi de it 0 1 2 3 4 5 6 7}}
     {-access_token string -nodefault}
+    {-cookies      dict   -nodefault}
   }}} {
     ::procarg::parse
+    if { ![array size opts] } {
+      return $setup
+    }
     if { [info exists opts(-app_id)] } {
-      set app_id $opts(-app_id)
+      dict set setup app_id $opts(-app_id)
     }
     if { [info exists opts(-lang)] } {
-	    set lang $opts(-lang)
-    }
-    if { [info exists opts(-scope)] } {
-      set scope $opts(-scope)
+	    dict set setup lang $opts(-lang)
     }
     if { [info exists opts(-access_token)] } {
-      set access_token $opts(-access_token)
+      dict set setup access_token $opts(-access_token)
+    }
+    if { [info exists opts(-cookies)] } {
+      dict set setup cookies $opts(-cookies)
     }
   }
 
@@ -105,20 +104,57 @@ package require procarg
   }}} {
     ::procarg::parse
     coroutine [self object]::[set myrid [incr rid]] my Auth [array get opts] $myrid
-    {*}$return
-  } 
+    if { ![info exists opts(-callback)] } {
+      vwait [self namespace]::response($myrid)
+      set result $response($myrid)
+      unset response($myrid)
+      return $result
+    }
+    return
+  }
+
+  method Cookies { action {token {}} } {
+    if { $action eq "format" } {
+		  set result [list]
+		  if { [dict exists $setup cookies] } {
+		    dict for { key val } [dict get $setup cookies] {
+		      lappend result "${key}=${val}"
+		    }
+		  }
+		  if { [llength $result] } {
+        return [list "Cookie" [join $result "; "]]
+		  } {
+		    return ""
+		  }
+    } elseif { $action eq "parse" } {
+			foreach { key val } [::http::meta $token] {
+				if { $key ne "Set-Cookie" } continue
+				set val [split [lindex [split $val "\;"] 0] =]
+				set key [string trim [lindex $val 0]]
+				set val [string trim [join [lrange $val 1 end] =]]
+				if { $val eq "DELETED" } {
+				  if { [dict exists $setup cookies $key] } {
+				    dict unset setup cookies $key
+				  }
+				} {
+			  	dict set setup cookies $key $val
+			  }
+		  }
+		} {
+		  return -code error "::vkapi::Cookies error, unknown action."
+		}
+  }
 
   method Auth { o myrid } {
 	  if { ![dict exists $o -callback] } {
 	    dict set o -callback [list set [self namespace]::response($myrid)]
 	  }
-	  set cookies [dict create]
-	  puts "get cookies"
+	  dict unset setup cookies
+#	  puts "get cookies"
 	  if { [catch [list ::http::geturl "https://new.vk.com/" -command [info coroutine]] errmsg] } {
 	    {*}$error -100 "error while get cookies - $errmsg"
 	  } {
 	    set token [yield]
-	    puts "got token [::http::status $token] [::http::code $token]"
 	    if { [::http::status $token] eq "error" } {
 	      {*}$error -100 "error while get cookies - status: [::http::status $token], error: [::http::error $token]"
 	    } elseif { [::http::status $token] ne "ok" } {
@@ -126,25 +162,17 @@ package require procarg
 	    } elseif { [::http::ncode $token] ne "200" } {
 	      {*}$error -100 "error while get cookies - server return code: [::http::code $token]"
 	    } {
-	      puts "ok"
-	      foreach { key val } [::http::meta $token] {
-	        if { $key ne "Set-Cookie" } continue
-          set val [split [lindex [split $val "\;"] 0] =]
-	        dict set cookies [string trim [lindex $val 0]] [string trim [join [lrange $val 1 end] =]]
-	      }
-	      puts "form query"
+	      my Cookies parse $token
 	      set query [dict create act login email [dict get $o -login] pass [dict get $o -password]]
 	      set data [::http::data $token]
 	      foreach key {_origin ip_h lg_h} {
-	        puts "key: $key"
 	        if { ![regexp -nocase "name=\"$key\"\\s+value=\"\(\[^\"\]+)\"" $data -> val] } continue
 	        dict set query $key $val
 	      }
 	      unset data
-	      puts "xxx"
-	      if { ![dict exists $cookies remixlang] } {
+	      if { ![dict exists $setup cookies remixlang] } {
 	        {*}$error -100 "error while get cookies - cookie 'remixlang' not found in server response"
-	      } elseif { ![dict exists $cookies remixlhk] } {
+	      } elseif { ![dict exists $setup cookies remixlhk] } {
 	        {*}$error -100 "error while get cookies - cookie 'remixlhk' not found in server response"
 	      } elseif { ![dict exists $query _origin] } {
 	        {*}$error -100 "error while get cookies - form field '_origin' not found in server response"
@@ -154,15 +182,10 @@ package require procarg
 	        {*}$error -100 "error while get cookies - form field 'lg_h' not found in server response"
 	      }
 	    }
-	    puts "cleanup 1"
 	    ::http::cleanup $token
 	    if { ![info exists result] } {
-		    set cook [list]
-		    dict for { key val } $cookies {
-		      lappend cook "${key}=${val}"
-		    }
-		    puts "auth..."
-	      if { [catch [list ::http::geturl "https://login.vk.com/" -command [info coroutine] -query [::http::formatQuery {*}$query] -headers [list "Cookie" [join $cook "; "]]] errmsg] } {
+#		    puts "auth..."
+	      if { [catch [list ::http::geturl "https://login.vk.com/" -command [info coroutine] -query [::http::formatQuery {*}$query] -headers [my Cookies format]] errmsg] } {
 			    {*}$error -101 "error while auth - $errmsg"
 	      } {
 			    set token [yield]
@@ -172,22 +195,100 @@ package require procarg
 			      {*}$error -101 "error while auth - status: [::http::status $token]"
 			    } elseif { [::http::ncode $token] ne "302" } {
 			      {*}$error -101 "error while auth - server return code: [::http::code $token]"
+			    } elseif { ![dict exists [::http::meta $token] Location] } {
+			      {*}$error -101 "error while auth - no location header in server response."
 			    } {
-			      foreach { key val } [::http::meta $token] {
-			        if { $key eq "Location" } {
-			          set location $val
-			        }
-			        if { $key ne "Set-Cookie" } continue
-		          set val [split [lindex [split $val "\;"] 0] =]
-			        dict set cookies [string trim [lindex $val 0]] [string trim [join [lrange $val 1 end] =]]
+			      my Cookies parse $token
+			      if { ![dict exists $setup cookies p] } {
+			        {*}$error -101 "error while auth - cookie 'p' not found in server response"
+			      } elseif { ![dict exists $setup cookies l] } {
+			        {*}$error -101 "error while auth - cookie 'l' not found in server response"
+			      } elseif { [string first {__q_hash} [set location [dict get [::http::meta $token] Location]]] == -1 } {
+			        {*}$error -101 "error while auth - no '__q_hash' string in location header of server response."
 			      }
-
 			    }
 			    ::http::cleanup $token
+			    if { ![info exists result] } {
+#			      puts "auth2..."
+			      if { [catch [list ::http::geturl $location -command [info coroutine] -headers [my Cookies format]] errmsg] } {
+			      	{*}$error -102 "error while auth2 - $errmsg"
+			      } {
+			        set token [yield]
+	  		  		if { [::http::status $token] eq "error" } {
+					      {*}$error -102 "error while auth2 - status: [::http::status $token], error: [::http::error $token]"
+					    } elseif { [::http::status $token] ne "ok" } {
+					      {*}$error -102 "error while auth2 - status: [::http::status $token]"
+					    } elseif { [::http::ncode $token] ne "302" } {
+			  		    {*}$error -102 "error while auth2 - server return code: [::http::code $token]"
+			  		  } {
+			  		    my Cookies parse $token
+					      if { ![dict exists $setup cookies remixsid] && ![dict exists $setup cookies remixsid6] } {
+					        {*}$error -102 "error while auth2 - cookie 'remixsid' not found in server response"
+			  		    }
+			  		  }
+			  		  ::http::cleanup $token
+			  		  if { ![info exists result] } {
+#			  		    puts "get access_token..."
+			  		    if { [catch [list ::http::geturl "http://oauth.vk.com/authorize" -command [info coroutine] -headers [my Cookies format] -query [::http::formatQuery \
+			  		      client_id     [dict get $setup app_id] \
+			  		      scope         [dict get $setup scope] \
+			  		      redirect_uri  "http://api.vk.com/blank.html" \
+			  		      response_type "token" \
+			  		      display       "wap"]] errmsg] \
+			  		    } {
+					      	{*}$error -103 "error while request access_token - $errmsg"
+			  		    } {
+			  		      set token [yield]
+			  		  		if { [::http::status $token] eq "error" } {
+							      {*}$error -103 "error while request access_token - status: [::http::status $token], error: [::http::error $token]"
+							    } elseif { [::http::status $token] ne "ok" } {
+							      {*}$error -103 "error while request access_token - status: [::http::status $token]"
+							    }
+							    if { [::http::ncode $token] eq "302" } {
+							      if { ![dict exists [::http::meta $token] Location] } {
+							        {*}$error -103 "error while request access_token - no location header in server 302 response."
+							      } elseif { [string first {grant_access} [set location [dict get [::http::meta $token] Location]]] == -1 } {
+							        {*}$error -103 "error while request access_token - invalid location header in server 302 response"
+							      }
+							    } elseif { [::http::ncode $token] eq "200" } {
+										if { ![regexp -nocase "action=\"(https://login.vk.com/\\?act=grant_access\[^\"\]+)\"" [::http::data $token] -> location] } {
+					  		    	{*}$error -103 "error while request access_token - no grant access link in server response."
+						  		  }
+							    } {
+					  		    {*}$error -103 "error while request access_token - server return code: [::http::code $token]"
+							    }
+					  		  ::http::cleanup $token
+					  		  if { ![info exists result] } {
+#					  		    puts "get access_token2..."
+					  		    if { [catch [list ::http::geturl $location -command [info coroutine] -headers [my Cookies format] -query ""] errmsg] } {
+					  		      {*}$error -104 "error while request2 access_token - $errmsg"
+					  		    } {
+					  		      set token [yield]
+					  		  		if { [::http::status $token] eq "error" } {
+									      {*}$error -104 "error while request2 access_token - status: [::http::status $token], error: [::http::error $token]"
+									    } elseif { [::http::status $token] ne "ok" } {
+									      {*}$error -104 "error while request2 access_token - status: [::http::status $token]"
+							  		  } elseif { [::http::ncode $token] ne "302" } {
+							  		    {*}$error -104 "error while request2 access_token - server return code: [::http::code $token]"
+							  		  } elseif { ![dict exists [::http::meta $token] Location] } {
+			    						  {*}$error -104 "error while request2 access_token - no location header in server response."
+									    } elseif { ![regexp {#access_token=([^&]+)&} [dict get [::http::meta $token] Location] -> access_token] } {
+									      {*}$error -104 "error while request2 access_token - no access_token in location header of server response."
+									    }
+									    ::http::cleanup $token
+									    if { ![info exists result] } {
+									      my setup -access_token $access_token
+									      set result "status ok"
+									    }
+					  		    }
+					  		  }
+			  		    }
+			  		  }
+			      }
+			    }
 	      }
 	    }
 	  }
-	  puts "callback: [dict get $o -callback]"
     after 0 [linsert [dict get $o -callback] end $result]
     return
   }
@@ -197,7 +298,10 @@ package require procarg
 	    dict set o -callback [list set [self namespace]::response($myrid)]
 	  }
 	  if { ![dict exists $o lang] } {
-		  dict set o lang $lang
+		  dict set o lang [dict get $setup lang]
+		}
+		if { [dict exists $setup access_token] } {
+		  dict set o access_token [dict get $setup access_token]
 		}
 
 	  if { [dict exists $o -limit-count] && [dict exists $o -limit-field] && ![dict exists $o count] && ![dict exists $o offset] } {
@@ -217,6 +321,8 @@ package require procarg
 	      lappend query "offset" $limit_offset "count" $limit_count
 		    unset limit_progress
 	    }
+	    puts "request: https://api.vk.com/method/${func}"
+	    puts "query: [::http::formatQuery {*}$query]"
 	    if { [catch [list ::http::geturl "https://api.vk.com/method/${func}" -query [::http::formatQuery {*}$query] -command [info coroutine]] errmsg] } {
 	      {*}$error -1 $errmsg
 	    } {
